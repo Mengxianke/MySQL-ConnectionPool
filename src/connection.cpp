@@ -6,7 +6,7 @@
 #include "thread"
 #include <algorithm>
 #include <stdexcept>
-
+#include "performance_monitor.h"
 
 Connection::Connection(
     const std::string& host,
@@ -118,6 +118,7 @@ bool Connection::reconnect() {
 
     if (!m_mysql) {
         LOG_ERROR("Failed to initialize MySQL object during reconnection [" + m_connectionId + "]: ");
+        PerformanceMonitor::getInstance().recordReconnection(false);
         return false;
     }    
 
@@ -138,6 +139,7 @@ bool Connection::reconnect() {
         if (result != nullptr) {
             m_successfulReconnects++;
             LOG_DEBUG("Success to reconnect to MySQL server [" + m_connectionId + "]"  + " attempt times:" + std::to_string(attempt));
+            PerformanceMonitor::getInstance().recordReconnection(true);
             return true;
         }
         // record reconnection error
@@ -156,6 +158,8 @@ bool Connection::reconnect() {
             lock.lock();
         }        
     }
+    PerformanceMonitor::getInstance().recordReconnection(false);
+    return false;
 }
 
 
@@ -228,11 +232,11 @@ void Connection::updateLastActiveTime() {
 
 
 QueryResultPtr Connection::executeQuery(const std::string& sql) {
-    return executeInternal(sql, true);
+    return executeQueryWithReconnect(sql, true);
 }
 
 unsigned long long Connection::executeUpdate(const std::string& sql) {
-    auto queryResult_ptr = executeInternal(sql, false);
+    auto queryResult_ptr = executeQueryWithReconnect(sql, false);
     return queryResult_ptr? queryResult_ptr->getAffectedRows() : 0;
 }
 
@@ -284,7 +288,7 @@ QueryResultPtr Connection::executeInternal(const std::string& sql, bool isQuery)
 
 
 QueryResultPtr Connection::executeQueryWithReconnect(const std::string& sql, bool isQuery) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    auto startTime = std::chrono::steady_clock::now();
     // first retry mysql connection
     unsigned int errorCode = 0;
     std::string errorMessage;
@@ -302,7 +306,11 @@ QueryResultPtr Connection::executeQueryWithReconnect(const std::string& sql, boo
         }
 
         try {
-            return executeInternal(sql, isQuery);
+            auto queryResult = executeInternal(sql, isQuery);
+            auto endTime = std::chrono::steady_clock::now();
+            auto takenTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+            PerformanceMonitor::getInstance().recordQueryExecuted(takenTime.count(), true);
+            return queryResult;
         } catch(const db::SQLExecutionError& e) {
             // catch database errorMesg, and code
             errorCode = e.getErrorCode();
@@ -310,6 +318,9 @@ QueryResultPtr Connection::executeQueryWithReconnect(const std::string& sql, boo
             
             if (!isConnectionError(errorCode)) {
                 LOG_ERROR("exectuteQueryWithReconnection meet other errors, errorCode: " + std::to_string(errorCode));
+                auto endTime = std::chrono::steady_clock::now();
+                auto takenTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+                PerformanceMonitor::getInstance().recordQueryExecuted(takenTime.count(), false);
                 throw std::runtime_error("exectuteQueryWithReconnection meet other errors");
             }
 
@@ -317,14 +328,16 @@ QueryResultPtr Connection::executeQueryWithReconnect(const std::string& sql, boo
             LOG_WARNING("Connection lost during " + std::string(isQuery ? "query" : "update") +
                         " execution [" + m_connectionId + "]: " + errorMessage);
         }
-
-        // 所有重试都失败了
-        std::string error = "Failed to execute " + std::string(isQuery ? "query" : "update") +
-                            " after " + std::to_string(m_reconnectAttempts + 1) + " attempts [" +
-                            m_connectionId + "]: " + errorMessage + " SQL: " + sql;
-        LOG_ERROR(error);
-        throw std::runtime_error(error);
     }
+    // 所有重试都失败了
+    std::string error = "Failed to execute " + std::string(isQuery ? "query" : "update") +
+                        " after " + std::to_string(m_reconnectAttempts + 1) + " attempts [" +
+                        m_connectionId + "]: " + errorMessage + " SQL: " + sql;
+    LOG_ERROR(error);
+    auto endTime = std::chrono::steady_clock::now();
+    auto takenTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+    PerformanceMonitor::getInstance().recordQueryExecuted(takenTime.count(), false);
+    throw std::runtime_error(error);
 }
 
 

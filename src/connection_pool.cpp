@@ -8,7 +8,7 @@
 #include "pool_config.h"
 #include "logger.h"
 #include "utils.h"
-
+#include <performance_monitor.h>
 
 ConnectionPool::ConnectionPool() {
     LOG_DEBUG("ConnectionPool instance created");
@@ -24,28 +24,36 @@ ConnectionPool::~ConnectionPool() {
 
 
 ConnectionPtr ConnectionPool::createConnection() {
-    
-    DBConfig config = LoadBalancer::getInstance().getNextDatabase();
+    try {
+        DBConfig config = LoadBalancer::getInstance().getNextDatabase();
 
-    // call connection method
-    ConnectionPtr conn = std::make_shared<Connection>(
-        config.host,
-        config.user,
-        config.password,
-        config.database,
-        config.port,
-        m_config.reconnectInterval,
-        m_config.reconnectAttempts
-    );
+        // call connection method
+        ConnectionPtr conn = std::make_shared<Connection>(
+            config.host,
+            config.user,
+            config.password,
+            config.database,
+            config.port,
+            m_config.reconnectInterval,
+            m_config.reconnectAttempts
+        );
 
-    auto conn_res = conn->connect();
-    if (!conn_res) {
-        std::string error = "cannot create a connectionId";
-        throw std::runtime_error(error);
+        auto conn_res = conn->connect();
+        if (!conn_res) {
+            std::string error = "cannot create a connectionId";
+            PerformanceMonitor::getInstance().recordConnectionFailed();
+            throw std::runtime_error(error);
+        }
+        PerformanceMonitor::getInstance().recordConnectionCreated();
+        // create the connection successfully
+        LOG_DEBUG("create a connection successfully. connectionId: " + conn->getConnectionId());
+        return conn;
+    } catch(std::exception& e) {
+        PerformanceMonitor::getInstance().recordConnectionFailed();
+        LOG_ERROR("ConnectionPool::createConnection createConnection has error: " + std::string(e.what()));
+        throw;
     }
-    // create the connection successfully
-    LOG_DEBUG("create a connection successfully. connectionId: " + conn->getConnectionId());
-    return conn;
+    
 }
 
 
@@ -134,8 +142,12 @@ PoolConfig ConnectionPool::getConfig() const {
 ConnectionPtr ConnectionPool::getConnection(unsigned int timeout) {
 
     if (!m_isRunning) {
+        PerformanceMonitor::getInstance().recordConnectionFailed();
         throw std::runtime_error("Connection pool is not in running status, cannot get a Connection from the pool");
     }
+
+
+    auto startTime = std::chrono::steady_clock::now();
 
     // use default value
     if (timeout == 0) {
@@ -156,6 +168,9 @@ ConnectionPtr ConnectionPool::getConnection(unsigned int timeout) {
                 m_idleConnections.pop();
                 m_activeConnections[idelConnection->getConnectionId()] =  idelConnection;
                 idelConnection->updateLastActiveTime();
+                auto endTime = std::chrono::steady_clock::now();
+                auto takenTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+                PerformanceMonitor::getInstance().recordConnectionAcquired(takenTime.count());
                 return idelConnection;
             } else {
                 m_totalConnections--;
@@ -186,7 +201,6 @@ ConnectionPtr ConnectionPool::getConnection(unsigned int timeout) {
             }
         } catch(const std::exception& e) {
                 LOG_ERROR("ConnectionPool::getConnection no avaliable connection and try to create a connection, but failed");
-
                 if (!lock.owns_lock()) {
                     lock.lock();
                 }
@@ -214,12 +228,14 @@ void ConnectionPool::releaseConnection(ConnectionPtr connection) {
     auto connId = connection->getConnectionId();
     LOG_INFO("release  a connection conId: " + connId);
     m_activeConnections.erase(connId);
-
+    auto usageTime = Utils::currentTimeMillis() - connection->getLastActiveTime();
     // check total Connections
     if (m_totalConnections > m_config.maxConnections) {
         connection->close();
         m_totalConnections--;
         m_condition.notify_all();
+        PerformanceMonitor::getInstance().recordConnectionReleased(usageTime);
+        return;
     }
 
     if (this->validateConnection(connection, false)) {
@@ -245,6 +261,7 @@ void ConnectionPool::releaseConnection(ConnectionPtr connection) {
             }
         }
     }
+    PerformanceMonitor::getInstance().recordConnectionReleased(usageTime);
     // notify other threads
     m_condition.notify_all();   
 }
